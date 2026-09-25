@@ -1,424 +1,497 @@
-import gradio as gr
+"""
+Pair verification GUI.
+
+Reviewers see two annotations side by side and answer Same / Different / Can't tell.
+Pairs come from an SQLite database (see VAREID.libraries.ui.db_scripts) that the
+postprocessing step, or the LCA ui_human reviewer, fills and reads back.
+
+Presentation
+  * Each crop is padded to a common aspect ratio and scaled to the same display
+    height, so a distant animal is shown at the same size as a close one.
+  * Scroll to zoom, drag to pan, double-click to reset. A toggle shows the full
+    image with the box drawn, for context.
+
+Decisions
+  * A decision is held for UNDO_GRACE_SECONDS before it is written to the
+    database. Undo (or Z) within that time takes it back without any record.
+  * Back reopens the previous pair whatever its state: an answered pair has its
+    decision cleared, and a pair the clustering step already consumed is
+    reopened so the new answer is sent again on the next poll.
+"""
+
 import argparse
-from VAREID.libraries.ui.db_scripts import (
-    update_status, get_next_pair_atomic, release_pair, 
-    start_heartbeat_system, init_db, get_instance_stats,
-    update_heartbeat, INSTANCE_IDENTIFIER
-)
+import atexit
+import base64
+import io
+import json
+import math
 import os
 import threading
 import time
-import atexit
-import json
-from PIL import Image
+
+import gradio as gr
+from PIL import Image, ImageDraw
+
+from VAREID.libraries.ui.db_scripts import (
+    update_status, get_next_pair_atomic, release_pair, reopen_pair,
+    start_heartbeat_system, init_db, get_instance_stats,
+    update_heartbeat, INSTANCE_IDENTIFIER
+)
 
 os.environ["GRADIO_TEMP_DIR"] = os.path.expanduser("~/gradio_cache")
 
-# Global variables
-current_pair = {"id": None, "image1": None, "image2": None, "bbox1": None, "bbox2": None}
-history_stack = []
+# ---------------------------------------------------------------------------
+# Presentation settings
+# ---------------------------------------------------------------------------
+DISPLAY_HEIGHT = 520          # px; both panels are rendered at this height
+CROP_ASPECT = 4 / 3           # width / height that every crop is padded to
+PAD_COLOR = (32, 32, 32)
+FULL_MAX_WIDTH = 1600         # full images are downscaled to this width before embedding
+BOX_COLOR = (255, 214, 0)
+UNDO_GRACE_SECONDS = 5
+JPEG_QUALITY = 88
+RENDER_CACHE_LIMIT = 64
+
+LABELS = {"correct": "Same", "incorrect": "Different", "cant_tell": "Can't tell", "none": "none", None: "none"}
+
+# ---------------------------------------------------------------------------
+# State (one reviewer per process)
+# ---------------------------------------------------------------------------
+db_path = None
+current_pair = None     # pair dict being shown, reserved (in_progress) by this instance
+pending = None          # {"pair": dict, "label": str, "deadline": float} awaiting commit
+history = []            # pairs shown before the current one, most recent last
+show_full = False
 heartbeat_timer = None
+_render_cache = {}
 
 
-def crop_image_with_bbox(image_path, bbox_json):
-    """Crop image according to bounding box if provided"""
-    if not image_path or image_path == "NO_IMAGE":
+def configure(path):
+    """Set the database this process works on (used by main and by tests)."""
+    global db_path
+    db_path = path
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+def _pad_to_aspect(img, aspect):
+    w, h = img.size
+    target_w = max(w, int(round(h * aspect)))
+    target_h = max(h, int(round(target_w / aspect)))
+    canvas = Image.new("RGB", (target_w, target_h), PAD_COLOR)
+    canvas.paste(img, ((target_w - w) // 2, (target_h - h) // 2))
+    return canvas
+
+
+def _scale_to_display(img):
+    """Resize a CROP_ASPECT-padded image to the exact display size. Padding leaves
+    the aspect within a pixel of CROP_ASPECT, so the residual distortion is below
+    a third of a percent, and every panel gets identical pixel dimensions."""
+    return img.resize((int(round(DISPLAY_HEIGHT * CROP_ASPECT)), DISPLAY_HEIGHT), Image.LANCZOS)
+
+
+def _clamp_bbox(bbox, width, height):
+    x1, y1, x2, y2 = bbox
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(width, int(x2)), min(height, int(y2))
+    if x2 <= x1 or y2 <= y1:
         return None
-    
-    if not os.path.exists(image_path):
-        print(f"Warning: Image file not found: {image_path}")
+    return x1, y1, x2, y2
+
+
+def prepare_view(image_path, bbox_json, full_view):
+    """Return a PIL image of the crop (or the full frame with the box drawn),
+    padded to CROP_ASPECT and scaled to DISPLAY_HEIGHT. None if unavailable."""
+    if not image_path or image_path == "NO_IMAGE" or not os.path.exists(image_path):
         return None
-    
     try:
-        # Load the image
-        img = Image.open(image_path)
-        
-        # If no bbox, return original image path
-        if not bbox_json:
-            return image_path
-        
-        # Parse bbox
-        bbox = json.loads(bbox_json)
-        x1, y1, x2, y2 = bbox
-        
-        # Ensure coordinates are within image bounds
-        x1 = max(0, int(x1))
-        y1 = max(0, int(y1))
-        x2 = min(img.width, int(x2))
-        y2 = min(img.height, int(y2))
-        
-        # Crop the image
-        cropped = img.crop((x1, y1, x2, y2))
-        
-        # Save to temp file
-        temp_path = os.path.join(os.path.expanduser("~/gradio_cache"), f"cropped_{os.path.basename(image_path)}")
-        os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-        cropped.save(temp_path)
-        
-        return temp_path
-        
+        img = Image.open(image_path).convert("RGB")
     except Exception as e:
-        print(f"Error cropping image: {e}")
-        # If cropping fails, return original image
-        return image_path
+        print(f"Error loading image {image_path}: {e}")
+        return None
+
+    bbox = None
+    if bbox_json:
+        try:
+            bbox = _clamp_bbox(json.loads(bbox_json), img.width, img.height)
+        except Exception as e:
+            print(f"Error parsing bbox {bbox_json}: {e}")
+
+    if full_view:
+        if bbox:
+            ImageDraw.Draw(img).rectangle(bbox, outline=BOX_COLOR, width=max(3, img.width // 400))
+        if img.width > FULL_MAX_WIDTH:
+            img = img.resize((FULL_MAX_WIDTH, max(1, int(round(img.height * FULL_MAX_WIDTH / img.width)))), Image.LANCZOS)
+    elif bbox:
+        img = img.crop(bbox)
+
+    return _scale_to_display(_pad_to_aspect(img, CROP_ASPECT))
 
 
+def _placeholder_html(text):
+    return (f'<div class="vz vz-empty" style="height:{DISPLAY_HEIGHT}px">'
+            f'<span>{text}</span></div>')
+
+
+def render_side(image_path, bbox_json, full_view):
+    """HTML for one panel: a zoomable container with the image embedded as a data URI."""
+    key = (image_path, bbox_json, bool(full_view))
+    if key in _render_cache:
+        return _render_cache[key]
+
+    img = prepare_view(image_path, bbox_json, full_view)
+    if img is None:
+        html = _placeholder_html("No image available")
+    else:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=JPEG_QUALITY)
+        uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        html = (f'<div class="vz" style="height:{DISPLAY_HEIGHT}px">'
+                f'<img src="{uri}" draggable="false" alt="">'
+                f'<span class="vz-hint">scroll: zoom · drag: pan · double-click: reset</span></div>')
+
+    if len(_render_cache) >= RENDER_CACHE_LIMIT:
+        _render_cache.clear()
+    _render_cache[key] = html
+    return html
+
+
+HEAD = """
+<style>
+.vz{position:relative;overflow:hidden;width:100%;background:#202020;border-radius:8px;
+    cursor:grab;user-select:none;touch-action:none}
+.vz img{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:contain;
+    transform-origin:0 0;will-change:transform}
+.vz .vz-hint{position:absolute;right:8px;bottom:6px;font:12px sans-serif;color:#ddd;
+    opacity:.6;pointer-events:none}
+.vz-empty{display:flex;align-items:center;justify-content:center;color:#999;
+    font:16px sans-serif;cursor:default}
+</style>
+<script>
+(function(){
+  const state = new WeakMap();
+  function get(el){ let s = state.get(el); if(!s){ s = {k:1, x:0, y:0, drag:null}; state.set(el, s); } return s; }
+  function apply(el, s){ const img = el.querySelector('img'); if(img){ img.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.k})`; } }
+  document.addEventListener('wheel', function(e){
+    const el = e.target.closest && e.target.closest('.vz'); if(!el || !el.querySelector('img')) return;
+    e.preventDefault();
+    const s = get(el), r = el.getBoundingClientRect();
+    const px = e.clientX - r.left, py = e.clientY - r.top;
+    const f = e.deltaY < 0 ? 1.15 : 1/1.15;
+    const k = Math.min(12, Math.max(1, s.k * f)), ratio = k / s.k;
+    s.x = px - (px - s.x) * ratio; s.y = py - (py - s.y) * ratio; s.k = k;
+    if(k === 1){ s.x = 0; s.y = 0; }
+    apply(el, s);
+  }, {passive:false});
+  document.addEventListener('mousedown', function(e){
+    const el = e.target.closest && e.target.closest('.vz'); if(!el || e.button !== 0) return;
+    const s = get(el); s.drag = {x: e.clientX - s.x, y: e.clientY - s.y};
+    el.style.cursor = 'grabbing'; e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e){
+    document.querySelectorAll('.vz').forEach(function(el){
+      const s = state.get(el); if(s && s.drag){ s.x = e.clientX - s.drag.x; s.y = e.clientY - s.drag.y; apply(el, s); }
+    });
+  });
+  document.addEventListener('mouseup', function(){
+    document.querySelectorAll('.vz').forEach(function(el){ const s = state.get(el); if(s){ s.drag = null; el.style.cursor = 'grab'; } });
+  });
+  document.addEventListener('dblclick', function(e){
+    const el = e.target.closest && e.target.closest('.vz'); if(!el) return;
+    const s = get(el); s.k = 1; s.x = 0; s.y = 0; apply(el, s);
+  });
+  document.addEventListener('keydown', function(e){
+    const t = e.target.tagName; if(t === 'INPUT' || t === 'TEXTAREA' || e.ctrlKey || e.metaKey || e.altKey) return;
+    const map = {'1':'btn-same','2':'btn-different','3':'btn-cant-tell','z':'btn-undo','Z':'btn-undo','Backspace':'btn-back','f':'chk-full','F':'chk-full'};
+    const id = map[e.key]; if(!id) return;
+    const el = document.getElementById(id); if(!el) return;
+    const target = el.tagName === 'BUTTON' ? el : el.querySelector('button,input');
+    if(target){ target.click(); e.preventDefault(); }
+  });
+})();
+</script>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat for the pair on screen
+# ---------------------------------------------------------------------------
 def start_pair_heartbeat(pair_id):
-    """Start sending heartbeats for a pair"""
     global heartbeat_timer
-    
+
     def send_heartbeat():
-        if current_pair.get("id") == pair_id:
+        global heartbeat_timer
+        if current_pair is not None and current_pair.get("id") == pair_id:
             update_heartbeat(pair_id, db_path)
-            # Schedule next heartbeat
-            global heartbeat_timer
             heartbeat_timer = threading.Timer(30.0, send_heartbeat)
             heartbeat_timer.daemon = True
             heartbeat_timer.start()
-    
-    # Cancel any existing timer
-    if heartbeat_timer:
-        heartbeat_timer.cancel()
-    
-    # Start new heartbeat
+
+    stop_pair_heartbeat()
     send_heartbeat()
 
 
 def stop_pair_heartbeat():
-    """Stop sending heartbeats"""
     global heartbeat_timer
     if heartbeat_timer:
         heartbeat_timer.cancel()
         heartbeat_timer = None
 
 
-def fetch_pair():
-    """Atomically fetch and reserve a pair from the database"""
-    result = get_next_pair_atomic(db_path=db_path)
-    if result:
-        pair_id, img1_path, img2_path, bbox1, bbox2, cluster1, cluster2, score = result
-        return {
-            "id": pair_id,
-            "image1": img1_path,
-            "image2": img2_path,
-            "bbox1": bbox1,
-            "bbox2": bbox2,
-            "cluster1": cluster1,
-            "cluster2": cluster2,
-            "score": score
-        }
-    return None
-
-
-def clear_images():
-    """Return empty images to clear the display"""
-    return None, None, "Loading new images...", "", "", True
-
-
-def load_next_pair():
-    """Load the next image pair"""
-    global current_pair
-    
-    # Stop heartbeat for current pair
-    stop_pair_heartbeat()
-    
-    # Add current pair to history if valid (but don't release it yet)
-    if current_pair["id"] is not None:
-        history_stack.append(current_pair.copy())
-    
-    # Fetch a new pair
-    pair_data = fetch_pair()
-    if pair_data:
-        current_pair = pair_data
-        # Start heartbeat for new pair
-        start_pair_heartbeat(current_pair["id"])
-        
-        # Crop images based on bounding boxes
-        cropped_img1 = crop_image_with_bbox(current_pair["image1"], current_pair["bbox1"])
-        cropped_img2 = crop_image_with_bbox(current_pair["image2"], current_pair["bbox2"])
-        
-        # Get instance stats for status message
-        stats = get_instance_stats(db_path)
-        _score = current_pair.get('score')
-        _score_str = f"{_score:.2f}" if isinstance(_score, (int, float)) else "n/a"
-        status_msg = (f"Loaded pair {current_pair['id']} | "
-                     f"Score: {_score_str} | "
-                     f"Available: {stats['awaiting']} | "
-                     f"Active instances: {stats['active_instances']} | "
-                     f"Instance: {INSTANCE_IDENTIFIER}")
-        return cropped_img1, cropped_img2, status_msg, f"**Cluster ID: {current_pair['cluster1']}**", f"**Cluster ID: {current_pair['cluster2']}**", False
-
-    else:
-        current_pair = {"id": None, "image1": None, "image2": None, "bbox1": None, "bbox2": None, "cluster1": None, "cluster2": None}
-        stats = get_instance_stats(db_path)
-        status_msg = (f"No pairs available | "
-                     f"Awaiting: {stats['awaiting']} | "
-                     f"In progress: {stats['in_progress']} | "
-                     f"Checked: {stats['checked']}")
-        
-        return None, None, status_msg, None, None, True
-
-
-def refresh_and_load():
-    """Simple function: check for pairs and load if available"""
-    global current_pair
+# ---------------------------------------------------------------------------
+# View helpers
+# ---------------------------------------------------------------------------
+def _stats_msg(prefix):
     stats = get_instance_stats(db_path)
-
-    if current_pair.get("id") is None and stats['awaiting'] > 0:
-        return load_next_pair()
-
-    if current_pair.get("id"):
-        cropped_img1 = crop_image_with_bbox(current_pair["image1"], current_pair["bbox1"])
-        cropped_img2 = crop_image_with_bbox(current_pair["image2"], current_pair["bbox2"])
-        cluster1 = f"**Cluster ID: {current_pair['cluster1']}**"
-        cluster2 = f"**Cluster ID: {current_pair['cluster2']}**"
-        status_msg = (f"Working on pair {current_pair['id']} | "
-                      f"Available: {stats['awaiting']} | "
-                      f"Active instances: {stats['active_instances']} | "
-                      f"Instance: {INSTANCE_IDENTIFIER}")
-        return cropped_img1, cropped_img2, status_msg, cluster1, cluster2, False
-    else:
-        status_msg = (f"No active pair | "
-                      f"Available: {stats['awaiting']} | "
-                      f"In progress: {stats['in_progress']} | "
-                      f"Checked: {stats['checked']} | "
-                      f"Instance: {INSTANCE_IDENTIFIER}")
-        return None, None, status_msg, "", "", stats['awaiting'] == 0
+    return (f"{prefix} | Available: {stats['awaiting']} | Checked: {stats['checked']} | "
+            f"Active instances: {stats['active_instances']} | Instance: {INSTANCE_IDENTIFIER}")
 
 
-def timer_check():
-    """Timer only calls refresh when specific conditions met"""
-    # Only refresh if: no pair loaded AND pairs might be available
-    if current_pair.get("id") is None:
-        stats = get_instance_stats(db_path)
-        if stats['awaiting'] > 0:
-            return refresh_and_load()
-    
-    # Otherwise do nothing
+def _undo_text():
+    if pending is None:
+        return ""
+    remaining = max(0, math.ceil(pending["deadline"] - time.time()))
+    return (f"Last answer: **{LABELS.get(pending['label'], pending['label'])}** "
+            f"(pair {pending['pair']['id']}). Press **Undo** or **Z** within {remaining} s to take it back.")
+
+
+def _view(status_msg):
+    """Render the current state as the outputs tuple."""
+    if current_pair is None:
+        empty = _placeholder_html("No pair loaded")
+        return empty, empty, status_msg, "", "", _undo_text()
+    html1 = render_side(current_pair["image1"], current_pair["bbox1"], show_full)
+    html2 = render_side(current_pair["image2"], current_pair["bbox2"], show_full)
+    c1 = f"**Cluster ID: {current_pair.get('cluster1')}**"
+    c2 = f"**Cluster ID: {current_pair.get('cluster2')}**"
+    return html1, html2, status_msg, c1, c2, _undo_text()
+
+
+def _skip():
     return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
 
-def submit_decision(label):
-    """Submit user decision and trigger the two-step update"""
+def _fetch_next():
+    result = get_next_pair_atomic(db_path=db_path)
+    if not result:
+        return None
+    pair_id, img1, img2, bbox1, bbox2, cluster1, cluster2, score = result
+    return {"id": pair_id, "image1": img1, "image2": img2, "bbox1": bbox1, "bbox2": bbox2,
+            "cluster1": cluster1, "cluster2": cluster2, "score": score}
+
+
+# ---------------------------------------------------------------------------
+# Decision bookkeeping
+# ---------------------------------------------------------------------------
+def commit_pending():
+    """Write the held decision to the database (no-op if nothing is held)."""
+    global pending
+    if pending is None:
+        return False
+    ok = update_status(pending["pair"]["id"], pending["label"], db_path=db_path)
+    if not ok:
+        print(f"Warning: could not record decision for pair {pending['pair']['id']}")
+    pending = None
+    return ok
+
+
+def commit_if_expired():
+    if pending is not None and time.time() >= pending["deadline"]:
+        commit_pending()
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+def load_next_pair():
     global current_pair
-    
-    # Stop heartbeat
     stop_pair_heartbeat()
-    
-    # Store current pair ID before updating
-    current_id = current_pair.get("id")
-    
-    if current_id is not None:
-        # Submit decision in background
-        def update_in_background():
-            success = update_status(current_id, label, db_path=db_path)
-            if not success:
-                print(f"Warning: Failed to update pair {current_id} - may have been taken by another instance")
-        
-        threading.Thread(target=update_in_background).start()
-    
-    # First step: Clear images
-    return clear_images()
+    pair = _fetch_next()
+    if pair is None:
+        current_pair = None
+        return _view(_stats_msg("No pairs available"))
+    current_pair = pair
+    start_pair_heartbeat(pair["id"])
+    score = pair.get("score")
+    score_str = f"{score:.2f}" if isinstance(score, (int, float)) else "n/a"
+    return _view(_stats_msg(f"Loaded pair {pair['id']} | Score: {score_str}"))
 
 
-def load_after_decision():
-    """Second step: Load new images after clearing"""
+def decide(label):
+    """Hold the decision for the grace period and move on to the next pair."""
+    global current_pair, pending
+    if current_pair is None:
+        return _view(_stats_msg("No pair loaded"))
+    commit_pending()                       # the previous held answer becomes final
+    stop_pair_heartbeat()
+    pending = {"pair": current_pair, "label": label, "deadline": time.time() + UNDO_GRACE_SECONDS}
+    history.append(current_pair)
+    current_pair = None
     return load_next_pair()
 
 
-def go_back_clear():
-    """First step of going back: clear images and release current pair"""
-    global current_pair
-    
-    # Stop heartbeat
+def undo():
+    """Take back the held answer; nothing was written. Otherwise behaves like Back."""
+    global current_pair, pending
+    if pending is None:
+        return back()
+    if current_pair is not None:
+        release_pair(current_pair["id"], db_path=db_path)
     stop_pair_heartbeat()
-    
-    # Release current pair back to awaiting status
-    if current_pair.get("id") is not None:
-        def release_in_background():
-            success = release_pair(current_pair["id"], db_path=db_path)
-            if not success:
-                print(f"Warning: Could not release pair {current_pair['id']} - may have been taken by another instance")
-        threading.Thread(target=release_in_background).start()
-    
-    return clear_images()
+    pair = pending["pair"]
+    pending = None
+    if history and history[-1]["id"] == pair["id"]:
+        history.pop()
+    current_pair = pair                    # still reserved by this instance
+    start_pair_heartbeat(pair["id"])
+    return _view(f"Answer withdrawn for pair {pair['id']}; nothing was recorded. Choose again.")
 
 
-def go_back_load():
-    """Second step of going back: try to load previous pair"""
-    global current_pair
-    
-    if history_stack:
-        # Try to get the previous pair again
-        previous = history_stack.pop()
-        
-        # Try to re-acquire the previous pair atomically
-        # First check if it's still available
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT status FROM image_verification WHERE id=?", (previous["id"],))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if result and result[0] == 'awaiting':
-            # Try to get it through normal atomic method
-            # Set it back to awaiting first, then try to get it
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE image_verification 
-                SET status='awaiting' 
-                WHERE id=? AND status='awaiting'
-            """, (previous["id"],))
-            conn.commit()
-            conn.close()
-            
-            # Now try to get it
-            result = get_next_pair_atomic(db_path)
-            if result and result[0] == previous["id"]:
-                current_pair = previous
-                start_pair_heartbeat(current_pair["id"])
-                
-                # Crop images based on bounding boxes
-                cropped_img1 = crop_image_with_bbox(current_pair["image1"], current_pair["bbox1"])
-                cropped_img2 = crop_image_with_bbox(current_pair["image2"], current_pair["bbox2"])
-                
-                status_msg = f"Returned to previous pair {current_pair['id']}"
-                return cropped_img1, cropped_img2, status_msg, f"**Cluster ID: {current_pair['cluster1']}**", f"**Cluster ID: {current_pair['cluster2']}**", False
-        
-        # If we couldn't get the previous pair, get a new one
-        status_msg = "Previous pair no longer available, loading new pair..."
-        next_result = load_next_pair()
-        return next_result[0], next_result[1], status_msg, next_result[3], next_result[4], next_result[5]
-    else:
-        # No history available
-        stats = get_instance_stats(db_path)
-        status_msg = f"No history to go back to | Available: {stats['awaiting']}"
-        if current_pair["id"] is not None:
-            start_pair_heartbeat(current_pair["id"])  # Restart heartbeat
-            
-            # Crop images based on bounding boxes
-            cropped_img1 = crop_image_with_bbox(current_pair["image1"], current_pair["bbox1"])
-            cropped_img2 = crop_image_with_bbox(current_pair["image2"], current_pair["bbox2"])
-            
-            return cropped_img1, cropped_img2, status_msg, f"**Cluster ID: {current_pair['cluster1']}**", f"**Cluster ID: {current_pair['cluster2']}**", False
+def back():
+    """Return to the previous pair and clear its decision."""
+    global current_pair, pending
+    if pending is not None and history and history[-1]["id"] == pending["pair"]["id"]:
+        return undo()
+    commit_pending()
+    if not history:
+        return _view(_stats_msg("No previous pair to go back to"))
+
+    previous = history.pop()
+    ok, prev_status, prev_decision = reopen_pair(previous["id"], db_path=db_path)
+    if not ok:
+        if prev_status == "in_progress":
+            note = "is being reviewed by another instance"
+        elif prev_status is None:
+            note = "no longer exists in the database"
         else:
-            return None, None, status_msg, "", "", True
+            note = f"could not be reopened (status: {prev_status})"
+        return _view(f"Previous pair {previous['id']} {note}.")
+
+    if current_pair is not None:
+        release_pair(current_pair["id"], db_path=db_path)
+    stop_pair_heartbeat()
+    current_pair = previous
+    start_pair_heartbeat(previous["id"])
+
+    answer = LABELS.get(prev_decision, prev_decision)
+    if prev_status == "sent":
+        msg = (f"Reopened pair {previous['id']}. Its answer '{answer}' was already consumed by the "
+               f"clustering step; a new answer will be sent again on the next poll.")
+    elif prev_status == "checked":
+        msg = f"Reopened pair {previous['id']}. Its answer '{answer}' has been cleared; choose again."
+    else:
+        msg = f"Returned to pair {previous['id']} (it had no answer yet)."
+    return _view(msg)
+
+
+def toggle_full(value):
+    global show_full
+    show_full = bool(value)
+    return _view(_stats_msg("Showing full images with box" if show_full else "Showing crops"))
+
+
+def refresh():
+    if current_pair is None:
+        return load_next_pair()
+    return _view(_stats_msg(f"Working on pair {current_pair['id']}"))
+
+
+def timer_tick():
+    """Once a second: commit an expired held answer, update the undo countdown,
+    and pick up new pairs when nothing is on screen."""
+    committed = commit_if_expired()
+    if current_pair is None:
+        stats = get_instance_stats(db_path)
+        if stats["awaiting"] > 0:
+            return load_next_pair()
+        if committed:
+            return _view(_stats_msg("No pairs available"))
+        return _skip()
+    if pending is not None or committed:
+        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), _undo_text()
+    return _skip()
 
 
 def cleanup_on_exit():
-    """Clean up any active pairs when the app shuts down"""
-    global current_pair
+    commit_pending()
     stop_pair_heartbeat()
-    if current_pair.get("id") is not None:
+    if current_pair is not None and db_path:
         release_pair(current_pair["id"], db_path)
 
 
-# Register cleanup function
 atexit.register(cleanup_on_exit)
 
-# Create the Gradio interface
-with gr.Blocks() as demo:
-    gr.Markdown("## ID Verification Interface")
-    all_done_flag = gr.State(value=False)
-    
-    # Status message
-    status = gr.Textbox(label="Status", value="Loading...", interactive=False)
-    
-    with gr.Row():
-        with gr.Column():
-            cluster1_label = gr.Markdown("**Cluster ID: ?**", elem_id="cluster1")
-            img1 = gr.Image(label="Image 1", type="filepath", show_label=False)
-        with gr.Column():
-            cluster2_label = gr.Markdown("**Cluster ID: ?**", elem_id="cluster2")
-            img2 = gr.Image(label="Image 2", type="filepath", show_label=False)
 
-        
-    with gr.Row():
-        btn_back = gr.Button("⬅ Back")
-        btn_yes = gr.Button("Same")
-        btn_no = gr.Button("Different")
-        btn_cant_tell = gr.Button("Can't tell")
-        btn_refresh_status = gr.Button("🔄 Refresh Status")
-    
-    # Simple timer - only refreshes when no pair loaded and pairs available
-    timer = gr.Timer(value=1, active=True)
-    timer.tick(
-        fn=timer_check,
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    )
-    
-    # Two-step update process for decisions
-    btn_yes.click(
-        lambda *args: submit_decision("correct"), 
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    ).then(
-        lambda *args: load_after_decision(),
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    )
-    
-    btn_no.click(
-        lambda *args: submit_decision("incorrect"), 
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    ).then(
-        lambda *args: load_after_decision(),
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    )
-    
-    btn_cant_tell.click(
-        lambda *args: submit_decision("cant_tell"), 
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    ).then(
-        lambda *args: load_after_decision(),
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    )
-    
-    # Two-step update process for back button
-    btn_back.click(
-        lambda *args: go_back_clear(),
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    ).then(
-        lambda *args: go_back_load(),
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    )
-    
-    # Refresh status button - calls same function as timer
-    btn_refresh_status.click(
-        lambda *args: refresh_and_load(),
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    )
-    
-    # Load initial pair on startup
-    demo.load(
-        lambda *args: load_next_pair(),
-        outputs=[img1, img2, status, cluster1_label, cluster2_label, all_done_flag]
-    )
+# ---------------------------------------------------------------------------
+# Interface
+# ---------------------------------------------------------------------------
+def build_interface():
+    with gr.Blocks(head=HEAD, title="ID Verification") as demo:
+        gr.Markdown(
+            "## ID Verification Interface\n"
+            "Scroll to zoom, drag to pan, double-click to reset. "
+            "Keys: **1** Same, **2** Different, **3** Can't tell, **Z** Undo, **Backspace** Back, **F** full image."
+        )
+        status = gr.Textbox(label="Status", value="Loading...", interactive=False)
+        undo_box = gr.Markdown("")
+
+        with gr.Row():
+            with gr.Column():
+                cluster1_label = gr.Markdown("**Cluster ID: ?**", elem_id="cluster1")
+                panel1 = gr.HTML(_placeholder_html("Loading..."), elem_id="panel1")
+            with gr.Column():
+                cluster2_label = gr.Markdown("**Cluster ID: ?**", elem_id="cluster2")
+                panel2 = gr.HTML(_placeholder_html("Loading..."), elem_id="panel2")
+
+        with gr.Row():
+            full_toggle = gr.Checkbox(label="Show full image with box (F)", value=False, elem_id="chk-full")
+
+        with gr.Row():
+            btn_back = gr.Button("⬅ Back", elem_id="btn-back")
+            btn_undo = gr.Button("↶ Undo (Z)", elem_id="btn-undo")
+            btn_yes = gr.Button("Same (1)", elem_id="btn-same", variant="primary")
+            btn_no = gr.Button("Different (2)", elem_id="btn-different", variant="primary")
+            btn_cant_tell = gr.Button("Can't tell (3)", elem_id="btn-cant-tell")
+            btn_refresh = gr.Button("🔄 Refresh")
+
+        outputs = [panel1, panel2, status, cluster1_label, cluster2_label, undo_box]
+
+        timer = gr.Timer(value=1, active=True)
+        timer.tick(fn=timer_tick, outputs=outputs)
+
+        btn_yes.click(lambda: decide("correct"), outputs=outputs)
+        btn_no.click(lambda: decide("incorrect"), outputs=outputs)
+        btn_cant_tell.click(lambda: decide("cant_tell"), outputs=outputs)
+        btn_undo.click(undo, outputs=outputs)
+        btn_back.click(back, outputs=outputs)
+        btn_refresh.click(refresh, outputs=outputs)
+        full_toggle.change(toggle_full, inputs=[full_toggle], outputs=outputs)
+        demo.load(load_next_pair, outputs=outputs)
+    return demo
+
 
 if __name__ == "__main__":
-    # Parse command-line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--db', required=True, help='Path to SQLite database')
     parser.add_argument('--allowed_dir', required=True, help='The directory that the GUI is allowed to access')
+    parser.add_argument('--no_share', action='store_true', help='Do not create a public share link')
     args = parser.parse_args()
     print("GUI: Loading args...")
 
-    db_path = args.db
-
-    # Initialize database and start heartbeat system
+    configure(args.db)
     init_db(db_path)
     start_heartbeat_system(db_path)
-    
     print(f"Starting instance {INSTANCE_IDENTIFIER}")
-    
-    # Launch the interface with allowed paths
+
+    demo = build_interface()
     try:
         demo.launch(
-            
-            server_name="0.0.0.0",  # Allow external connections
-            share=True,
-            allowed_paths=[args.allowed_dir]  # Add data directory to allowed paths
+            server_name="0.0.0.0",
+            share=not args.no_share,
+            allowed_paths=[args.allowed_dir]
         )
     finally:
-        # Close port upon termination
         demo.close()

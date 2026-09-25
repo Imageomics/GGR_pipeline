@@ -455,7 +455,12 @@ def split_conflicting_cluster(parent_key, targets, grouped_all, all_lca_ids_view
     sibling_keys = []
 
     for tkey in sorted(targets, key=str):
-        num_tids = {a['tracking_id'] for a in grouped_all[tkey] if str(a['tracking_id']).isdigit()}
+        # A conflict snapshot can name a target that an earlier split in this same
+        # pass already emptied and removed (mutual X_left <-> X_right conflicts).
+        # Its annotations have moved into that target's split-siblings, so there is
+        # nothing to split against here; skip it and let the next reconciliation
+        # cycle re-detect the conflict on the updated clustering.
+        num_tids = {a['tracking_id'] for a in grouped_all.get(tkey, []) if str(a['tracking_id']).isdigit()}
         anns_for_split = [a for a in parent_anns if a['tracking_id'] in num_tids and a['uuid'] not in moved_uuids]
         if not anns_for_split:
             continue

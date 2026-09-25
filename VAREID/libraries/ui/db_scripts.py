@@ -44,7 +44,9 @@ def init_db(db_path="./zebra_verification.db"):
         completed_at TIMESTAMP,
         instance_id TEXT,
         heartbeat TIMESTAMP,
-        read_at TIMESTAMP
+        read_at TIMESTAMP,
+        previous_decision TEXT,
+        corrected_at TIMESTAMP
     )
     """)
     conn.commit()
@@ -57,6 +59,14 @@ def init_db(db_path="./zebra_verification.db"):
     # Safe migration: add read_at column if the table existed before without it
     if not _column_exists(conn, "image_verification", "read_at"):
         cursor.execute("ALTER TABLE image_verification ADD COLUMN read_at TIMESTAMP")
+        conn.commit()
+
+    # Safe migration: correction bookkeeping (a pair re-answered through Back)
+    if not _column_exists(conn, "image_verification", "previous_decision"):
+        cursor.execute("ALTER TABLE image_verification ADD COLUMN previous_decision TEXT")
+        conn.commit()
+    if not _column_exists(conn, "image_verification", "corrected_at"):
+        cursor.execute("ALTER TABLE image_verification ADD COLUMN corrected_at TIMESTAMP")
         conn.commit()
 
     conn.close()
@@ -333,11 +343,13 @@ def update_status(pair_id, decision, db_path="./zebra_verification.db"):
     
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    now = datetime.now()
     cursor.execute("""
         UPDATE image_verification 
-        SET status='checked', decision=?, completed_at=?
+        SET status='checked', decision=?, completed_at=?,
+            corrected_at=CASE WHEN previous_decision IS NOT NULL THEN ? ELSE corrected_at END
         WHERE id=? AND instance_id=? AND status='in_progress'
-    """, (decision, datetime.now(), pair_id, INSTANCE_IDENTIFIER))
+    """, (decision, now, now, pair_id, INSTANCE_IDENTIFIER))
     
     if cursor.rowcount == 1:
         conn.commit()
@@ -374,6 +386,80 @@ def release_pair(pair_id, db_path="./zebra_verification.db"):
     
     conn.close()
     return success
+
+
+def get_pair(pair_id, db_path="./zebra_verification.db"):
+    """Return one pair as a dict (or None)."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM image_verification WHERE id=?", (pair_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def reopen_pair(pair_id, db_path="./zebra_verification.db"):
+    """
+    Take a pair back for re-review by this instance.
+
+    Works from any status except in_progress under another instance:
+      awaiting  -> reserved by this instance (like get_next_pair_atomic for one id)
+      checked   -> the recorded decision is cleared; nothing has consumed it yet
+      sent      -> the decision was already consumed by the clustering step;
+                   the pair is reopened and a new answer goes back to 'checked',
+                   which the consumer picks up again on its next poll
+    The earlier answer is kept in previous_decision for the audit trail.
+
+    Returns (success, previous_status, previous_decision).
+    """
+    global instance_active_pairs
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("BEGIN IMMEDIATE")
+    try:
+        cursor.execute("SELECT status, decision, instance_id FROM image_verification WHERE id=?", (pair_id,))
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            return False, None, None
+        status, decision, instance_id = row
+
+        if status == 'in_progress' and instance_id != INSTANCE_IDENTIFIER:
+            conn.rollback()
+            return False, status, decision
+
+        now = datetime.now()
+        if status == 'in_progress':
+            # Already ours (for example after a failed commit); just refresh the heartbeat
+            cursor.execute("UPDATE image_verification SET heartbeat=? WHERE id=?", (now, pair_id))
+        elif status == 'awaiting':
+            cursor.execute("""
+                UPDATE image_verification
+                SET status='in_progress', started_at=?, instance_id=?, heartbeat=?
+                WHERE id=? AND status='awaiting'
+            """, (now, INSTANCE_IDENTIFIER, now, pair_id))
+        else:  # checked or sent
+            cursor.execute("""
+                UPDATE image_verification
+                SET status='in_progress', started_at=?, instance_id=?, heartbeat=?,
+                    previous_decision=decision, decision='none', completed_at=NULL
+                WHERE id=? AND status IN ('checked', 'sent')
+            """, (now, INSTANCE_IDENTIFIER, now, pair_id))
+
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return False, status, decision
+        conn.commit()
+        instance_active_pairs.add(pair_id)
+        return True, status, decision
+    except Exception as e:
+        conn.rollback()
+        print(f"Error in reopen_pair: {e}")
+        return False, None, None
+    finally:
+        conn.close()
 
 
 def cleanup_instance_pairs(db_path="./zebra_verification.db"):
