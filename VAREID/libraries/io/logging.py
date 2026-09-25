@@ -115,6 +115,8 @@ def log_subprocess(command, logger, conn=None):
             
         if process.returncode != 0:
             logger.critical(f"Subprocess failed with exit code {process.returncode}")
+        return process.returncode
 
     except Exception as e:
         logger.critical(f"An unexpected error occurred: {e}")
+        return 1

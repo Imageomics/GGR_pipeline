@@ -1,4 +1,5 @@
 import argparse
+import sys
 
 from VAREID.libraries.io.format_funcs import load_config
 from VAREID.libraries.io.logging import log_subprocess, setup_logging
@@ -72,21 +73,34 @@ def main(args):
     lca_subunit_logs = config["lca_subunit_logs"]
     intra_flag = ""
     log_path = config["lca_logs"]
+    ui_db_path = config.get("lca_ui_db_path")
     if intra:
         lca_dir = config["encounter_lca_dir"]
         intra_flag = " --intra"
         log_path = config["encounter_lca_logs"]
         lca_subunit_logs = config["encounter_lca_subunit_logs"]
+        ui_db_path = config.get("encounter_lca_ui_db_path")
     elif inter:
         lca_dir = config["inter_lca_dir"]
         intra_flag = " --inter"
         log_path = config["inter_lca_logs"]
         lca_subunit_logs = config["inter_lca_subunit_logs"]
+        ui_db_path = config.get("inter_lca_ui_db_path")
+
+    # Human-review database for the ui_human reviewer (optional in config.yaml)
+    ui_db_flag = f"--ui_db_path {ui_db_path}" if ui_db_path else ""
     
-    command = f'python -u -m VAREID.algo.lca.lca {input} {config["mid_out_path"]} {lca_dir} {lca_subunit_logs} {log_path} {video_flag} {separation_flag} {intra_flag}'
+    # Output naming must match get_outputs(): {lca_out_prefix}_{lca_out_suffix}.json
+    naming_flag = f'--output_prefix {config["lca_out_prefix"]} --output_suffix {config["lca_out_suffix"]}'
+
+    command = f'python -u -m VAREID.algo.lca.lca {input} {config["mid_out_path"]} {lca_dir} {lca_subunit_logs} {log_path} {video_flag} {separation_flag} {intra_flag} {naming_flag} {ui_db_flag}'
     
     logger = setup_logging(log_path)
-    log_subprocess(command, logger)
+    returncode = log_subprocess(command, logger)
+    # Propagate failure so Snakemake reports the error itself rather than a
+    # missing output file.
+    if returncode:
+        sys.exit(returncode)
 
 
 if __name__ == "__main__":

@@ -81,7 +81,36 @@ def save_lca_results(input_dir, anno_file, output_path, prefix, suffix, field_fi
     print(f"Saved LCA results to {output_path_full}")
 
 
-def save_lca_results_unified(combinations, anno_file, output_path, prefix, suffix, uuid_key="annot_uuid"):
+def write_viewpoint_files(combined_path, output_dir, prefix, suffix, viewpoints=None):
+    """
+    Split the combined clustering output into one file per viewpoint,
+    named {prefix}_{viewpoint}_{suffix}.json. Postprocessing reads the left and
+    right files separately; beta_stability writes a single combined file.
+
+    Args:
+        combined_path: the combined annotation file written by beta_stability
+        output_dir: directory to write the per-viewpoint files into
+        prefix, suffix: output naming (same as the combined file)
+        viewpoints: viewpoints to write; defaults to those present in the data.
+            A viewpoint with no annotations still gets a file (empty annotation list)
+            so downstream steps that expect both files can load them.
+    """
+    data = load_json(combined_path)
+    annotations = data.get("annotations", [])
+    present = sorted({a.get("viewpoint") for a in annotations if a.get("viewpoint") is not None})
+    targets = list(viewpoints) if viewpoints else present
+    written = []
+    for viewpoint in targets:
+        subset = dict(data)
+        subset["annotations"] = [a for a in annotations if a.get("viewpoint") == viewpoint]
+        out_path = os.path.join(output_dir, f"{prefix}_{viewpoint}_{suffix}.json")
+        save_json(subset, out_path)
+        written.append(out_path)
+        print(f"Wrote {len(subset['annotations'])} {viewpoint} annotations to {out_path}")
+    return written
+
+
+def save_lca_results_unified(combinations, anno_file, output_path, prefix, suffix, uuid_key="annot_uuid", output_key="LCA_clustering_id"):
     """
     Save unified LCA results from multiple field combinations into a single file.
     Cluster IDs are remapped to avoid collisions across different field combinations.
@@ -197,6 +226,8 @@ if __name__ == "__main__":
     parser.add_argument("--ui_db_path", type=str, default=None, help="Override data.ui_db_path in the LCA input config.")
     parser.add_argument("--max_human_reviews", type=int, default=None, help="Override stability.max_human_reviews in the LCA input config.")
     parser.add_argument("--lca_config", type=str, default=None, help="Path to a custom LCA input config (YAML). Takes precedence over --intra/--inter/--video/--image defaults.")
+    parser.add_argument("--output_prefix", type=str, default=None, help="Prefix of the saved annotation file ({prefix}_{suffix}.json). Passed by lca_driver from lca_out_prefix.")
+    parser.add_argument("--output_suffix", type=str, default=None, help="Suffix of the saved annotation file ({prefix}_{suffix}.json). Passed by lca_driver from lca_out_suffix.")
 
     args = parser.parse_args()
 
@@ -249,8 +280,30 @@ if __name__ == "__main__":
 
     if args.ui_db_path is not None:
         input_config["data"]["ui_db_path"] = args.ui_db_path
+
+    # Output file naming. beta_stability names the saved annotation file
+    # {prefix}_{suffix}.json and falls back to beta_stability_annots.json when
+    # neither is set; the Snakemake rules expect {lca_out_prefix}_{lca_out_suffix}.json.
+    if args.output_prefix is not None or args.output_suffix is not None:
+        output_cfg = input_config.setdefault("output", {}) or {}
+        if args.output_prefix is not None:
+            output_cfg["prefix"] = args.output_prefix
+        if args.output_suffix is not None:
+            output_cfg["suffix"] = args.output_suffix
+        input_config["output"] = output_cfg
     if args.max_human_reviews is not None:
         input_config.setdefault("stability", {})["max_human_reviews"] = args.max_human_reviews
+
+    # A config that asks for the ui_human reviewer needs a database to talk to.
+    # Without one beta_stability silently answers reviews from the name_keys
+    # field (a simulated reviewer), which is never what a pipeline run wants.
+    verifier_names = str(input_config.get("edge_weights", {}).get("verifier_names", "")).split()
+    if "ui_human" in verifier_names and not input_config["data"].get("ui_db_path"):
+        raise SystemExit(
+            f"{input_config_name} requests the ui_human reviewer but no ui_db_path is set. "
+            "Set lca_ui_db_file in the pipeline config, pass --ui_db_path, or change "
+            "edge_weights.verifier_names to no_human."
+        )
 
     # Resolve effective separation settings from the merged config so all
     # downstream logic uses the same source of truth.
@@ -285,6 +338,19 @@ if __name__ == "__main__":
     output_path = args.lca_dir
     anno_file = args.annots
     uuid_key = input_config["data"]["id_key"]
+
+    # Postprocessing consumes one file per viewpoint ({prefix}_left_{suffix}.json,
+    # {prefix}_right_{suffix}.json). Derive them from the combined file for the
+    # plain (non-encounter) LCA stage.
+    if not (args.intra or args.inter):
+        out_prefix = args.output_prefix or "beta_stability"
+        out_suffix = args.output_suffix or "annots"
+        combined_path = os.path.join(output_path, f"{out_prefix}_{out_suffix}.json")
+        if os.path.exists(combined_path):
+            write_viewpoint_files(combined_path, output_path, out_prefix, out_suffix,
+                                  viewpoints=input_config["data"].get("viewpoint_list"))
+        else:
+            print(f"Warning: combined output {combined_path} not found; no per-viewpoint files written")
 
     # Collect all combinations for unified save
     combinations = []

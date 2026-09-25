@@ -9,6 +9,8 @@ data:
   - tracking_id
   # - individual_id
   id_key: "uuid"
+  # Field written into each annotation; postprocessing reads LCA_clustering_id.
+  output_key: LCA_clustering_id
   n_filter_min: 1
   n_filter_max: 100
   # annotation_file: ./zebra_annotations.json <-- provided by lca.py

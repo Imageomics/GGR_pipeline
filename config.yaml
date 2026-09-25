@@ -105,6 +105,11 @@ inter_lca_dirname: "inter_lca"
 inter_lca_subunit_logfile: "inter_lca_algorithm.txt"
 inter_lca_logfile: "inter_lca.txt"
 
+# SQLite database (inside the LCA output dir) that the review GUI reads pairs from
+# and LCA reads decisions back from when a config asks for the ui_human reviewer.
+# Set to ~ to disable; LCA then refuses to run configs that request ui_human.
+lca_ui_db_file: "lca_ui_decision_db.db"
+
 lca_separate_viewpoints: True
 
 # LCA is special: its output is formatted as {prefix}_{viewpoint}_{suffix}.json (or {prefix}_{suffix}.json if not separating viewpoint).

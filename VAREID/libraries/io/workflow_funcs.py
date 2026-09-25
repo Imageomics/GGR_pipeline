@@ -206,6 +206,12 @@ def build_config(config):
     post_right_in_path = os.path.join(lca_dir, f'{config["lca_out_prefix"]}_right_{config["lca_out_suffix"]}.json')
     # In image mode, we expect the following output to the entire pipeline:
     lca_out_path = os.path.join(lca_dir, f'{config["lca_out_prefix"]}_{config["lca_out_suffix"]}.json')
+
+    # Optional human-review database for LCA (ui_human reviewer), one per LCA stage
+    lca_ui_db_file = config.get("lca_ui_db_file")
+    lca_ui_db_path = os.path.join(lca_dir, lca_ui_db_file) if lca_ui_db_file else None
+    encounter_lca_ui_db_path = os.path.join(encounter_lca_dir, lca_ui_db_file) if lca_ui_db_file else None
+    inter_lca_ui_db_path = os.path.join(inter_lca_dir, lca_ui_db_file) if lca_ui_db_file else None
     encounter_lca_out_path = os.path.join(encounter_lca_dir, f'{config["lca_out_prefix"]}_{config["lca_out_suffix"]}.json')
     inter_lca_out_path = os.path.join(inter_lca_dir, f'{config["lca_out_prefix"]}_{config["lca_out_suffix"]}.json')
     
@@ -279,6 +285,9 @@ def build_config(config):
     config["lca_subunit_logs"] = lca_subunit_logs
     config["lca_logs"] = lca_logs
     config["lca_out_path"] = lca_out_path
+    config["lca_ui_db_path"] = lca_ui_db_path
+    config["encounter_lca_ui_db_path"] = encounter_lca_ui_db_path
+    config["inter_lca_ui_db_path"] = inter_lca_ui_db_path
     config["encounter_lca_out_path"] = encounter_lca_out_path
     config["inter_lca_out_path"] = inter_lca_out_path
     config["encounter_lca_logs"] = encounter_lca_logs
