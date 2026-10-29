@@ -2,83 +2,12 @@ import argparse
 import os
 import yaml
 
-import pandas as pd
+from beta_stability import config as beta_stability_config
+from beta_stability.init_logger import init_logger
+from beta_stability.run import run_from_config
 
-from beta_stability.run_clustering_with_save import run_clustering_with_save
-
-from VAREID.libraries.io.format_funcs import load_config, load_json, save_json, split_dataframe, join_dataframe_dict
+from VAREID.libraries.io.format_funcs import load_config, load_json, save_json
 from VAREID.libraries.utils import path_from_file
-
-
-def save_lca_results(input_dir, anno_file, output_path, prefix, suffix, field_filters=None, uuid_key="annot_uuid"):
-    """
-    Save LCA results with support for multiple field filtering.
-
-    Args:
-        field_filters: dict of {field_name: field_value} to filter on, e.g. {'viewpoint': 'left', 'encounter': 'E001'}
-    """
-    clustering_file = os.path.join(input_dir, "clustering.json")
-    node2uuid_file = os.path.join(input_dir, "node2uuid_file.json")
-
-    print(f"anno_file: {anno_file}")
-    # Load original annotation file
-    data = join_dataframe_dict(load_json(anno_file))
-
-    # Load clustering results
-    clusters = load_json(clustering_file)
-    node2uuid = load_json(node2uuid_file)
-
-    # Build mapping from UUID to cluster ID
-    uuid_to_cluster = {}
-    for cluster_id, nodes in clusters.items():
-        for node in nodes:
-            uuid = node2uuid.get(str(node))
-            if uuid:
-                uuid_to_cluster[uuid] = cluster_id
-
-    # Filter annotations based on field filters (substring matching)
-    if field_filters:
-        print(field_filters)
-        filtered_annotations = []
-        for ann in data['annotations']:
-            match = True
-            for field, value in field_filters.items():
-                # Check direct field or name_<field> pattern
-                field_value = ann.get(field) or ann.get(f"name_{field}")
-                if field_value is None:
-                    match = False
-                    break
-                # Substring matching (consistent with new filtering logic)
-                if str(value) not in str(field_value):
-                    match = False
-                    break
-            if match:
-                filtered_annotations.append(ann)
-
-        filter_desc = ', '.join(f"{k}={v}" for k, v in field_filters.items())
-        print(f"Filtered {len(filtered_annotations)} annotations with {filter_desc} "
-              f"out of {len(data['annotations'])}")
-    else:
-        filtered_annotations = data['annotations']
-
-    # Add LCA_clustering_id to each annotation
-    # for ann in filtered_annotations:
-    #     ann['LCA_clustering_id'] = uuid_to_cluster.get(ann[uuid_key], None)
-
-    # Build output path
-    if field_filters:
-        field_str = '_'.join(f"{k}-{v}" for k, v in field_filters.items())
-        output_filename = f"{prefix}_{field_str}_{suffix}.json"
-    else:
-        output_filename = f"{prefix}_{suffix}.json"
-    output_path_full = os.path.join(output_path, output_filename)
-
-    # Save final result with same categories/images, modified annotations
-    result_dict = split_dataframe(pd.DataFrame(filtered_annotations))
-
-    os.makedirs(os.path.dirname(output_path_full), exist_ok=True)
-    save_json(result_dict, output_path_full)
-    print(f"Saved LCA results to {output_path_full}")
 
 
 def write_viewpoint_files(combined_path, output_dir, prefix, suffix, viewpoints=None):
@@ -109,105 +38,6 @@ def write_viewpoint_files(combined_path, output_dir, prefix, suffix, viewpoints=
         print(f"Wrote {len(subset['annotations'])} {viewpoint} annotations to {out_path}")
     return written
 
-
-def save_lca_results_unified(combinations, anno_file, output_path, prefix, suffix, uuid_key="annot_uuid", output_key="LCA_clustering_id"):
-    """
-    Save unified LCA results from multiple field combinations into a single file.
-    Cluster IDs are remapped to avoid collisions across different field combinations.
-
-    Args:
-        combinations: list of (input_dir, field_filters) tuples
-        anno_file: path to the original annotation file
-        output_path: directory to save the output file
-        prefix: output file prefix
-        suffix: output file suffix
-        uuid_key: key to use for UUID lookups
-    """
-    print(f"Processing {len(combinations)} field combinations for unified output...")
-
-    # Load original annotation file once
-    data = join_dataframe_dict(load_json(anno_file))
-
-    # Track cluster ID offset and collect all annotations with updated cluster IDs
-    cluster_offset = 0
-    all_uuid_to_cluster = {}
-
-    for input_dir, field_filters in combinations:
-        clustering_file = os.path.join(input_dir, "clustering.json")
-        node2uuid_file = os.path.join(input_dir, "node2uuid_file.json")
-
-        # Check if clustering files exist
-        if not os.path.exists(clustering_file) or not os.path.exists(node2uuid_file):
-            filter_desc = ', '.join(f"{k}={v}" for k, v in field_filters.items()) if field_filters else "no filters"
-            print(f"Warning: Clustering files not found for {filter_desc}, skipping...")
-            continue
-
-        # Load clustering results
-        clusters = load_json(clustering_file)
-        node2uuid = load_json(node2uuid_file)
-
-        # Build mapping from UUID to cluster ID with offset
-        uuid_to_cluster_local = {}
-        max_cluster_id = -1
-
-        for cluster_id, nodes in clusters.items():
-            # Convert cluster_id to int for remapping (handle string cluster IDs)
-            try:
-                cluster_id_int = int(cluster_id)
-            except (ValueError, TypeError):
-                # Handle non-numeric cluster IDs (e.g., noise markers)
-                cluster_id_int = -1
-
-            for node in nodes:
-                uuid = node2uuid.get(str(node))
-                if uuid:
-                    # Apply offset to valid cluster IDs
-                    if cluster_id_int >= 0:
-                        remapped_cluster_id = str(cluster_id_int + cluster_offset)
-                        uuid_to_cluster_local[uuid] = remapped_cluster_id
-                        max_cluster_id = max(max_cluster_id, cluster_id_int)
-                    else:
-                        # Keep special cluster IDs as-is (e.g., -1 for noise)
-                        uuid_to_cluster_local[uuid] = cluster_id
-
-        # Merge into global mapping
-        all_uuid_to_cluster.update(uuid_to_cluster_local)
-
-        # Update offset for next iteration
-        if max_cluster_id >= 0:
-            cluster_offset += max_cluster_id + 1
-
-        filter_desc = ', '.join(f"{k}={v}" for k, v in field_filters.items()) if field_filters else "no filters"
-        print(f"  Processed {len(uuid_to_cluster_local)} UUIDs for {filter_desc}, "
-              f"cluster offset now at {cluster_offset}")
-
-    # Add LCA_clustering_id to all annotations that have a cluster assignment
-    annotations_with_clusters = 0
-    for ann in data['annotations']:
-        cluster_id = all_uuid_to_cluster.get(ann[uuid_key])
-        if cluster_id is not None:
-            ann[output_key] = cluster_id
-            annotations_with_clusters += 1
-        else:
-            ann[output_key] = None
-
-    print(f"Added cluster IDs to {annotations_with_clusters} annotations out of {len(data['annotations'])} total")
-
-    # Build output path
-    output_filename = f"{prefix}_{suffix}.json"
-    output_path_full = os.path.join(output_path, output_filename)
-
-    # Save final result with categories, images, and modified annotations
-    result_dict = {
-        'categories': data.get('categories', []),
-        'images': data.get('images', []),
-        'annotations': data['annotations']
-    }
-
-    os.makedirs(os.path.dirname(output_path_full), exist_ok=True)
-    save_json(result_dict, output_path_full)
-    print(f"Saved unified LCA results to {output_path_full}")
-    
 
 if __name__ == "__main__":
     print("Loading data...")
@@ -305,14 +135,11 @@ if __name__ == "__main__":
             "edge_weights.verifier_names to no_human."
         )
 
-    # Resolve effective separation settings from the merged config so all
-    # downstream logic uses the same source of truth.
-    effective_separate_by_fields = input_config["data"].get("separate_by_fields") or []
-    effective_separate_viewpoints = input_config["data"].get("separate_viewpoints", False)
-
-    # input_config["edge_weights"]["verifier_file"] = args.verifiers_probs
     input_config["logging"]["log_file"] = args.log_subunit_file # should append LCA outputs into same log file used by this script
-
+    # The pipeline expects the log at exactly log_subunit_file. update_log_file
+    # would append a timestamp to it, and beta_stability re-applies that for every
+    # field combination, so the name grows until it is too long for the filesystem.
+    input_config["logging"]["update_log_file"] = False
 
     # HDBSCAN alternative: override the algorithm_type; everything else in the
     # config still applies. The unified beta_stability runner picks the right
@@ -326,18 +153,20 @@ if __name__ == "__main__":
             f"{input_config.get('algorithm_type', 'stability')}"
         )
 
+    # Merge the input config over beta_stability's declared defaults, the same
+    # way `python -m beta_stability --config` does.
+    run_config = beta_stability_config.load_mapping(input_config)
+
     # WRITE CONFIG SNAPSHOT alongside the results (for reproducibility)
     config_loc = os.path.join(args.lca_dir, input_config_name)
     with open(config_loc, "w") as f:
-        yaml.dump(input_config, f)
+        yaml.dump(run_config, f)
 
-    # RUN — direct import, no subprocess, no cloned repo.
+    # RUN — beta_stability runs every field combination and writes the combined
+    # annotation file ({prefix}_{suffix}.json) into lca_dir itself.
     print("Begin Beta Stability subunit...")
-    run_clustering_with_save(input_config, config_path=config_loc, save_dir=args.lca_dir)
-
-    output_path = args.lca_dir
-    anno_file = args.annots
-    uuid_key = input_config["data"]["id_key"]
+    init_logger()
+    combined_path = run_from_config(run_config, save_dir=args.lca_dir)
 
     # Postprocessing consumes one file per viewpoint ({prefix}_left_{suffix}.json,
     # {prefix}_right_{suffix}.json). Derive them from the combined file for the
@@ -345,54 +174,5 @@ if __name__ == "__main__":
     if not (args.intra or args.inter):
         out_prefix = args.output_prefix or "beta_stability"
         out_suffix = args.output_suffix or "annots"
-        combined_path = os.path.join(output_path, f"{out_prefix}_{out_suffix}.json")
-        if os.path.exists(combined_path):
-            write_viewpoint_files(combined_path, output_path, out_prefix, out_suffix,
-                                  viewpoints=input_config["data"].get("viewpoint_list"))
-        else:
-            print(f"Warning: combined output {combined_path} not found; no per-viewpoint files written")
-
-    # Collect all combinations for unified save
-    combinations = []
-
-    if effective_separate_by_fields:
-        # New multi-field separation logic
-        import glob
-        import re
-
-        # Build regex pattern to match and extract field values
-        # Pattern: field1-value1_field2-value2_...
-        regex_pattern = "_".join([f"{field}-([^_]+)" for field in effective_separate_by_fields])
-        regex = re.compile(regex_pattern)
-
-        # Find all directories matching the pattern
-        glob_pattern = "_".join([f"{field}-*" for field in effective_separate_by_fields])
-
-        for input_dir in glob.glob(os.path.join(output_path, glob_pattern)):
-            if os.path.isdir(input_dir):
-                dir_name = os.path.basename(input_dir)
-                match = regex.match(dir_name)
-
-                if match:
-                    # Extract field values from regex groups
-                    field_combo = dict(zip(effective_separate_by_fields, match.groups()))
-                    combinations.append((input_dir, field_combo))
-
-    elif effective_separate_viewpoints:
-        # Legacy viewpoint separation
-        for viewpoint in input_config["data"]["viewpoint_list"]:
-            input_dir = os.path.join(output_path, viewpoint)
-            combinations.append((input_dir, {"viewpoint": viewpoint}))
-    else:
-        # No separation
-        input_dir = output_path
-        combinations.append((input_dir, None))
-
-    # Save unified results
-    # if len(combinations) > 0:
-    #     save_lca_results_unified(combinations, anno_file, output_path, args.output_prefix, args.output_suffix,
-    #                             uuid_key=uuid_key)
-    # else:
-    #     print("Warning: No clustering results found to save!")
-
-    exit()
+        write_viewpoint_files(combined_path, args.lca_dir, out_prefix, out_suffix,
+                              viewpoints=run_config["data"].get("viewpoint_list"))

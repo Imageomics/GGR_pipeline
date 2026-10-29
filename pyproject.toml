@@ -12,8 +12,10 @@ requires-python = "==3.11"
 dependencies = [
     # Beta Stability — active-review clustering algorithm.
     # Pinned to a specific commit for reproducibility; bump the SHA when the
-    # algorithm is updated. Source: https://github.com/WildMeOrg/lca
-    "beta_stability @ git+https://github.com/WildMeOrg/lca.git@0fc50b9fb6ebba447b8d1200bed00b1b8293a554",
+    # algorithm is updated. Source: https://github.com/Imageomics/beta-stability
+    # (f685341: main + fixes for epoch-second timestamps in metadata_verifier
+    # and for field combinations that filter to no annotations)
+    "beta_stability @ git+https://github.com/Imageomics/beta-stability.git@f68534112e81e3838e311ce1779bbe83a376e8ba",
 ]
 
 [tool.setuptools]
