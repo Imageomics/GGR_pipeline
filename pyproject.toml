@@ -13,9 +13,9 @@ dependencies = [
     # Beta Stability — active-review clustering algorithm.
     # Pinned to a specific commit for reproducibility; bump the SHA when the
     # algorithm is updated. Source: https://github.com/Imageomics/beta-stability
-    # (f685341: main + fixes for epoch-second timestamps in metadata_verifier
-    # and for field combinations that filter to no annotations)
-    "beta_stability @ git+https://github.com/Imageomics/beta-stability.git@f68534112e81e3838e311ce1779bbe83a376e8ba",
+    # (e42613f: main, with the review UI kept within max_human_reviews and
+    # can't-tell reviews read as no verdict)
+    "beta_stability @ git+https://github.com/Imageomics/beta-stability.git@e42613f248461c9695668de184b7557a39529f29",
 ]
 
 [tool.setuptools]
