@@ -5,6 +5,19 @@ import os
 
 from pathlib import Path
 
+
+def parse_datetime(value):
+    """Parse a datetime string, treating a bare number as Unix epoch seconds.
+
+    pd.to_datetime reads a bare number as nanoseconds, which would put every
+    image within seconds of 1970-01-01.
+    """
+    try:
+        return pd.to_datetime(float(value), unit='s')
+    except (ValueError, TypeError):
+        return pd.to_datetime(value)
+
+
 class metadata_verifier(object):
     def __init__(self, data_df, human_verifier, node2uuid):
         self.data_df = data_df
@@ -39,8 +52,8 @@ class metadata_verifier(object):
 
             # Extract datetimes and locations
             try:
-                dt1 = pd.to_datetime(meta1[2])
-                dt2 = pd.to_datetime(meta2[2])
+                dt1 = parse_datetime(meta1[2])
+                dt2 = parse_datetime(meta2[2])
                 time_diff_hours = abs((dt1 - dt2).total_seconds() / 3600)
             except Exception:
                 continue
