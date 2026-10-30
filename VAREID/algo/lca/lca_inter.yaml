@@ -96,6 +96,9 @@ edge_weights:
     miewid: 0.81
     metadata(miewid): miewid
   verifier_names: metadata(miewid) ui_human
+  # Re-stabilize once per fully answered batch, not after every answer, so the
+  # whole batch is decided before the next pairs are chosen.
+  ui_wait_for_full_batch: true
 
 logging:
   log_level: INFO

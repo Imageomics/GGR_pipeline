@@ -46,7 +46,8 @@ def init_db(db_path="./zebra_verification.db"):
         heartbeat TIMESTAMP,
         read_at TIMESTAMP,
         previous_decision TEXT,
-        corrected_at TIMESTAMP
+        corrected_at TIMESTAMP,
+        priority INTEGER
     )
     """)
     conn.commit()
@@ -67,6 +68,11 @@ def init_db(db_path="./zebra_verification.db"):
         conn.commit()
     if not _column_exists(conn, "image_verification", "corrected_at"):
         cursor.execute("ALTER TABLE image_verification ADD COLUMN corrected_at TIMESTAMP")
+        conn.commit()
+
+    # Safe migration: the order LCA wants its pairs reviewed in (lowest first)
+    if not _column_exists(conn, "image_verification", "priority"):
+        cursor.execute("ALTER TABLE image_verification ADD COLUMN priority INTEGER")
         conn.commit()
 
     conn.close()
@@ -289,11 +295,13 @@ def get_next_pair_atomic(db_path="./zebra_verification.db"):
     cursor.execute("BEGIN IMMEDIATE")
     
     try:
+        # LCA ranks the pairs it asks for, most unstable first (priority 0).
+        # Unranked pairs (e.g. postprocessing) follow, oldest first.
         cursor.execute("""
             SELECT id, image1_path, image2_path, bbox1, bbox2, cluster1, cluster2, score
             FROM image_verification
             WHERE status = 'awaiting'
-            ORDER BY id ASC LIMIT 1
+            ORDER BY priority IS NULL, priority, rowid LIMIT 1
         """)
         result = cursor.fetchone()
         
