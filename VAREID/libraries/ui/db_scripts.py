@@ -539,7 +539,9 @@ def get_instance_stats(db_path="./zebra_verification.db"):
             SUM(CASE WHEN status='awaiting' THEN 1 ELSE 0 END) as awaiting,
             SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END) as in_progress,
             SUM(CASE WHEN status='checked' THEN 1 ELSE 0 END) as checked,
-            COUNT(DISTINCT instance_id) as active_instances
+            COUNT(DISTINCT instance_id) as active_instances,
+            SUM(CASE WHEN status IN ('checked', 'sent') AND decision != 'none'
+                     THEN 1 ELSE 0 END) as answered
         FROM image_verification
     """)
     
@@ -562,6 +564,8 @@ def get_instance_stats(db_path="./zebra_verification.db"):
         'in_progress': stats[2],
         'checked': stats[3],
         'active_instances': stats[4],
+        # answered pairs, whether or not the clustering step has read them yet
+        'answered': stats[5] or 0,
         'instance_breakdown': instance_breakdown,
         'current_instance': INSTANCE_IDENTIFIER
     }

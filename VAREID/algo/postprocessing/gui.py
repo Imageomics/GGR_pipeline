@@ -58,18 +58,23 @@ LABELS = {"correct": "Same", "incorrect": "Different", "cant_tell": "Can't tell"
 # State (one reviewer per process)
 # ---------------------------------------------------------------------------
 db_path = None
+review_limit = None     # shown as "Reviewed: n / limit" when set
 current_pair = None     # pair dict being shown, reserved (in_progress) by this instance
 pending = None          # {"pair": dict, "label": str, "deadline": float} awaiting commit
 history = []            # pairs shown before the current one, most recent last
 show_full = False
+queued_view = None      # outputs tuple timer_tick has queued for the panels
+view_version = 0        # bumped when queued_view changes; drives the redraw
 heartbeat_timer = None
 _render_cache = {}
 
 
-def configure(path):
-    """Set the database this process works on (used by main and by tests)."""
-    global db_path
+def configure(path, limit=None):
+    """Set the database this process works on (used by main and by tests), and
+    the review limit shown next to the reviewed count (None shows no limit)."""
+    global db_path, review_limit
     db_path = path
+    review_limit = limit
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +249,10 @@ def stop_pair_heartbeat():
 # ---------------------------------------------------------------------------
 def _stats_msg(prefix):
     stats = get_instance_stats(db_path)
-    return (f"{prefix} | Available: {stats['awaiting']} | Checked: {stats['checked']} | "
+    # An answer still inside its undo grace period is not in the database yet.
+    reviewed = stats['answered'] + (1 if pending is not None else 0)
+    reviewed_str = f"{reviewed} / {review_limit}" if review_limit else str(reviewed)
+    return (f"{prefix} | Reviewed: {reviewed_str} | Available: {stats['awaiting']} | "
             f"Active instances: {stats['active_instances']} | Instance: {INSTANCE_IDENTIFIER}")
 
 
@@ -401,18 +409,32 @@ def refresh():
 
 def timer_tick():
     """Once a second: commit an expired held answer, update the undo countdown,
-    and pick up new pairs when nothing is on screen."""
+    and pick up new pairs when nothing is on screen.
+
+    Gradio dims every output of an event while it runs, so the tick only
+    outputs the undo line and a hidden counter. When the panels need redrawing
+    the tick queues the new view and bumps the counter, whose change event
+    draws it; otherwise the panels are left alone and do not blink.
+    """
+    global queued_view, view_version
     committed = commit_if_expired()
+    view = None
     if current_pair is None:
         stats = get_instance_stats(db_path)
         if stats["awaiting"] > 0:
-            return load_next_pair()
-        if committed:
-            return _view(_stats_msg("No pairs available"))
-        return _skip()
-    if pending is not None or committed:
-        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), _undo_text()
-    return _skip()
+            view = load_next_pair()
+        elif committed:
+            view = _view(_stats_msg("No pairs available"))
+    if view is None:
+        undo = _undo_text() if (pending is not None or committed) else gr.skip()
+        return gr.skip(), undo
+    queued_view = view
+    view_version += 1
+    return view_version, view[-1]
+
+
+def show_queued_view():
+    return queued_view
 
 
 def cleanup_on_exit():
@@ -459,8 +481,11 @@ def build_interface():
 
         outputs = [panel1, panel2, status, cluster1_label, cluster2_label, undo_box]
 
+        # The timer touches only the undo line and this hidden counter; see timer_tick.
+        version = gr.Number(value=0, visible=False)
         timer = gr.Timer(value=1, active=True)
-        timer.tick(fn=timer_tick, outputs=outputs)
+        timer.tick(fn=timer_tick, outputs=[version, undo_box], show_progress="hidden")
+        version.change(show_queued_view, outputs=outputs, show_progress="hidden")
 
         btn_yes.click(lambda: decide("correct"), outputs=outputs)
         btn_no.click(lambda: decide("incorrect"), outputs=outputs)
@@ -478,10 +503,13 @@ if __name__ == "__main__":
     parser.add_argument('--db', required=True, help='Path to SQLite database')
     parser.add_argument('--allowed_dir', required=True, help='The directory that the GUI is allowed to access')
     parser.add_argument('--no_share', action='store_true', help='Do not create a public share link')
+    parser.add_argument('--review_limit', type=int, default=None,
+                        help='Review limit to show next to the reviewed count, e.g. the '
+                             'max_human_reviews of the LCA config')
     args = parser.parse_args()
     print("GUI: Loading args...")
 
-    configure(args.db)
+    configure(args.db, args.review_limit)
     init_db(db_path)
     start_heartbeat_system(db_path)
     print(f"Starting instance {INSTANCE_IDENTIFIER}")
