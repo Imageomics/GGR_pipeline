@@ -78,11 +78,13 @@ stability:
   # Maximum human review attempts per edge
   tries_before_edge_done: 4
 
-  # Do not spend reviews on each cluster's weakest internal link. In the GGR2024 run
-  # with them (200 reviews), 53 went to such links and 50 of those only confirmed the
-  # cluster, while 70 of 127 merge candidates changed the clustering. Clusters with a
-  # conflict are still reviewed (INTERNAL candidates).
-  review_weakest_positive: false
+  # At most 2 of each batch go to a cluster's weakest internal link (a check for false
+  # merges). Uncapped they took ~15 of 50: in the GGR2024 run (200 reviews) 50 of 53 only
+  # confirmed the cluster, while 70 of 127 merge candidates changed the clustering.
+  # Simulated 200-review runs on GGR2024 (reviewer answering from all 892 stored answers):
+  # uncapped +65 above the best-available estimate, 0 false / 28 missed merges; cap 2 +47,
+  # 2 false / 24 missed; off +38, 3 false / 23 missed.
+  weak_positive_per_batch: 2
 
 # HDBSCAN fallback config
 hdbscan:
