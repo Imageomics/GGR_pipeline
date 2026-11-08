@@ -78,8 +78,11 @@ stability:
   # Maximum human review attempts per edge
   tries_before_edge_done: 4
 
-  # Merge priority: fraction of review batch dedicated to merge candidates (0.0-1.0)
-  merge_priority: 0.7
+  # Do not spend reviews on each cluster's weakest internal link. In the GGR2024 run
+  # with them (200 reviews), 53 went to such links and 50 of those only confirmed the
+  # cluster, while 70 of 127 merge candidates changed the clustering. Clusters with a
+  # conflict are still reviewed (INTERNAL candidates).
+  review_weakest_positive: false
 
 # HDBSCAN fallback config
 hdbscan:
