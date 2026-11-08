@@ -22,6 +22,7 @@ Decisions
 import argparse
 import atexit
 import base64
+import functools
 import io
 import json
 import math
@@ -67,6 +68,21 @@ queued_view = None      # outputs tuple timer_tick has queued for the panels
 view_version = 0        # bumped when queued_view changes; drives the redraw
 heartbeat_timer = None
 _render_cache = {}
+
+# Gradio runs different events at the same time: the 1-second timer can call
+# load_next_pair while decide() is between clearing the current pair and reserving
+# the next, and both then reserve a pair. The one not kept stayed in_progress for
+# good (its heartbeat kept it from looking stale), and a run waiting for its whole
+# batch then waited forever. One lock makes the handlers run one at a time.
+_state_lock = threading.RLock()
+
+
+def _serialized(handler):
+    @functools.wraps(handler)
+    def run(*args, **kwargs):
+        with _state_lock:
+            return handler(*args, **kwargs)
+    return run
 
 
 def configure(path, limit=None):
@@ -314,9 +330,15 @@ def commit_if_expired():
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+@_serialized
 def load_next_pair():
     global current_pair
     stop_pair_heartbeat()
+    # A page load or a second tab calls this with a pair still reserved: hand it back
+    # rather than leave it in_progress.
+    if current_pair is not None:
+        release_pair(current_pair["id"], db_path=db_path)
+        current_pair = None
     pair = _fetch_next()
     if pair is None:
         current_pair = None
@@ -328,6 +350,7 @@ def load_next_pair():
     return _view(_stats_msg(f"Loaded pair {pair['id']} | Score: {score_str}"))
 
 
+@_serialized
 def decide(label):
     """Hold the decision for the grace period and move on to the next pair."""
     global current_pair, pending
@@ -341,6 +364,7 @@ def decide(label):
     return load_next_pair()
 
 
+@_serialized
 def undo():
     """Take back the held answer; nothing was written. Otherwise behaves like Back."""
     global current_pair, pending
@@ -358,6 +382,7 @@ def undo():
     return _view(f"Answer withdrawn for pair {pair['id']}; nothing was recorded. Choose again.")
 
 
+@_serialized
 def back():
     """Return to the previous pair and clear its decision."""
     global current_pair, pending
@@ -395,18 +420,21 @@ def back():
     return _view(msg)
 
 
+@_serialized
 def toggle_full(value):
     global show_full
     show_full = bool(value)
     return _view(_stats_msg("Showing full images with box" if show_full else "Showing crops"))
 
 
+@_serialized
 def refresh():
     if current_pair is None:
         return load_next_pair()
     return _view(_stats_msg(f"Working on pair {current_pair['id']}"))
 
 
+@_serialized
 def timer_tick():
     """Once a second: commit an expired held answer, update the undo countdown,
     and pick up new pairs when nothing is on screen.
@@ -433,6 +461,7 @@ def timer_tick():
     return view_version, view[-1]
 
 
+@_serialized
 def show_queued_view():
     return queued_view
 
