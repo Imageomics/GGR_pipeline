@@ -46,8 +46,9 @@ stability:
   # Higher values require more human reviews but produce more reliable clusters
   target_alpha: 0.5
 
-  # Maximum number of human reviews before stopping
-  max_human_reviews: 200
+  # Maximum number of human reviews before stopping. A ceiling: the run normally
+  # stops earlier, when reviews stop changing the clustering (quiet_batches_to_stop).
+  max_human_reviews: 1000
 
   # Confidence added/subtracted per human review (in [0, 1] scale)
   review_confidence: 0.97
@@ -85,6 +86,12 @@ stability:
   # uncapped +65 above the best-available estimate, 0 false / 28 missed merges; cap 2 +47,
   # 2 false / 24 missed; off +38, 3 false / 23 missed.
   weak_positive_per_batch: 2
+
+  # Stop once 2 batches in a row changed at most 2 answers each: further reviews have
+  # stopped changing the clustering. Simulated on two GGR2024 graphs this stopped at
+  # 500-600 reviews, with fewer missed merges than a fixed 300-review budget.
+  quiet_batches_to_stop: 2
+  quiet_batch_max_changes: 2
 
 # HDBSCAN fallback config
 hdbscan:
